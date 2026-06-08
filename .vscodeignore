@@ -6,5 +6,11 @@ scripts/**
 .vscodeignore
 prompt.md
 tsconfig.json
-node_modules/**
 dist/**
+**/node_modules/**
+!node_modules/@vscode/ripgrep/**
+!node_modules/@vscode/ripgrep-win32-x64/**
+!node_modules/@vscode/ripgrep-darwin-x64/**
+!node_modules/@vscode/ripgrep-darwin-arm64/**
+!node_modules/@vscode/ripgrep-linux-x64/**
+!node_modules/@vscode/ripgrep-linux-arm64/**
