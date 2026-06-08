@@ -1,9 +1,22 @@
 import * as vscode from 'vscode';
+import { spawn } from 'child_process';
+import { rgPath } from '@vscode/ripgrep';
 
-const EXCLUDE_PATTERN = '{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/build/**,**/target/**}';
+const EXCLUDE_DIRS = ['node_modules', '.git', 'out', 'dist', 'build', 'target'];
+
+interface RgMatch {
+    path: { text: string };
+    lines: { text: string };
+    line_number: number;
+    absolute_offset: number;
+    submatches: Array<{
+        match: { text: string };
+        start: number;
+        end: number;
+    }>;
+}
 
 export class JavaDefinitionProvider implements vscode.DefinitionProvider, vscode.ReferenceProvider {
-    private fileCache = new Map<string, { text: string; mtime: number }>();
 
     async provideDefinition(
         document: vscode.TextDocument,
@@ -46,7 +59,6 @@ export class JavaDefinitionProvider implements vscode.DefinitionProvider, vscode
             return undefined;
         }
 
-        // 去重
         const seen = new Set<string>();
         const uniqueLocations = locations.filter(loc => {
             const key = `${loc.uri.fsPath}#${loc.range.start.line}`;
@@ -59,56 +71,38 @@ export class JavaDefinitionProvider implements vscode.DefinitionProvider, vscode
             return new vscode.Location(uniqueLocations[0].uri, new vscode.Range(uniqueLocations[0].range.start, uniqueLocations[0].range.start));
         }
 
-        // 多结果时返回所有，让 VS Code 自带 peek 视图处理，不弹 QuickPick
         return uniqueLocations.map(loc => new vscode.Location(loc.uri, new vscode.Range(loc.range.start, loc.range.start)));
     }
 
     private async findClassDefinition(className: string, originDocument: vscode.TextDocument): Promise<vscode.Location[]> {
-        const files = await vscode.workspace.findFiles('**/*.java', EXCLUDE_PATTERN, 500);
-        const locations: vscode.Location[] = [];
-
-        for (const file of files) {
-            if (file.fsPath === originDocument.uri.fsPath) { continue; }
-            const text = await this.getFileText(file);
-            if (!text) { continue; }
-
-            const regex = new RegExp(`\\b(class|interface|enum|record)\\s+${this.escapeRegExp(className)}\\b[\\s{]`, 'g');
-            let match;
-            while ((match = regex.exec(text)) !== null) {
-                const pos = this.offsetToPosition(text, match.index + match[0].indexOf(className));
-                locations.push(new vscode.Location(file, pos));
-            }
-        }
-        return locations;
+        const pattern = `\\b(class|interface|enum|record)\\s+${this.escapeRegExp(className)}\\b[\\s{]`;
+        const results = await this.rgSearch(pattern, ['-g', '*.java']);
+        return this.toLocations(results, originDocument);
     }
 
     private async findMethodDefinition(methodName: string, originDocument: vscode.TextDocument): Promise<vscode.Location[]> {
-        const files = await vscode.workspace.findFiles('**/*.{java,xml}', EXCLUDE_PATTERN, 500);
-        const locations: vscode.Location[] = [];
+        // 匹配方法定义行：包含修饰符和方法名(
+        const javaPattern = `^\\s*(?!.*\\breturn\\b)(?!.*=).*?\\b(public|private|protected|static|abstract|void|synchronized|native|strictfp)\\b.*?\\b${this.escapeRegExp(methodName)}\\s*\\(`;
+        const javaResults = await this.rgSearch(javaPattern, ['-g', '*.java']);
 
-        for (const file of files) {
-            const text = await this.getFileText(file);
-            if (!text) { continue; }
+        const xmlPattern = `id=["']${this.escapeRegExp(methodName)}["']`;
+        const xmlResults = await this.rgSearch(xmlPattern, ['-g', '*.xml']);
 
-            if (file.fsPath.endsWith('.xml')) {
-                // XML 中匹配 id="方法名"
-                const xmlRegex = new RegExp(`id=["']${this.escapeRegExp(methodName)}["']`, 'g');
-                let match;
-                while ((match = xmlRegex.exec(text)) !== null) {
-                    const pos = this.offsetToPosition(text, match.index + match[0].indexOf(methodName));
-                    locations.push(new vscode.Location(file, pos));
-                }
-            } else {
-                // Java 中匹配方法定义
-                const regex = new RegExp(`([\\r\\n]|^)(?!.*=)(?!.*\\breturn\\b).*?\\b(public|private|protected|static|abstract|void|synchronized|native|strictfp)\\b.*?(\\s|~)${this.escapeRegExp(methodName)}\\s*\\(`, 'g');
-                let match;
-                while ((match = regex.exec(text)) !== null) {
-                    const methodPos = match[0].lastIndexOf(methodName);
-                    const pos = this.offsetToPosition(text, match.index + methodPos);
-                    locations.push(new vscode.Location(file, pos));
-                }
+        const locations = this.toLocations([...xmlResults], originDocument);
+
+        // Java 方法定义需要从匹配行中精确定位方法名的列号
+        for (const r of javaResults) {
+            if (r.path.text === originDocument.uri.fsPath) { continue; }
+            const lineText = r.lines.text;
+            const idx = lineText.indexOf(methodName);
+            if (idx >= 0) {
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(r.path.text),
+                    new vscode.Position(r.line_number - 1, idx)
+                ));
             }
         }
+
         return locations;
     }
 
@@ -154,31 +148,24 @@ export class JavaDefinitionProvider implements vscode.DefinitionProvider, vscode
     }
 
     private async findMethodReferences(methodName: string, originDocument: vscode.TextDocument): Promise<vscode.Location[]> {
-        const files = await vscode.workspace.findFiles('**/*.java', EXCLUDE_PATTERN, 500);
+        const pattern = `\\b${this.escapeRegExp(methodName)}\\s*\\(`;
+        const results = await this.rgSearch(pattern, ['-g', '*.java']);
+
         const locations: vscode.Location[] = [];
+        for (const r of results) {
+            if (r.path.text === originDocument.uri.fsPath) { continue; }
 
-        for (const file of files) {
-            if (file.fsPath === originDocument.uri.fsPath) { continue; }
-            const text = await this.getFileText(file);
-            if (!text) { continue; }
+            const lineText = r.lines.text;
+            // 跳过方法定义行：包含修饰符且在同一行有 methodName(
+            const isDefinition = /\b(public|private|protected|static|abstract|void|synchronized|native|strictfp)\b/.test(lineText) &&
+                                 lineText.includes(methodName + '(');
+            if (isDefinition) { continue; }
 
-            const lines = text.split(/\r?\n/);
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line.includes(methodName)) { continue; }
-
-                // 跳过方法定义行（与 findMethodDefinition 的正则匹配相反）
-                const isDefinition = /\b(public|private|protected|static|abstract|void|synchronized|native|strictfp)\b.*?\b${this.escapeRegExp(methodName)}\s*\(/.test(line);
-                if (isDefinition) { 
-                    continue; 
-                }
-
-                // 匹配方法调用: methodName(
-                const callRegex = new RegExp(`\\b${this.escapeRegExp(methodName)}\\s*\\(`, 'g');
-                let callMatch;
-                while ((callMatch = callRegex.exec(line)) !== null) {
-                    locations.push(new vscode.Location(file, new vscode.Position(i, callMatch.index)));
-                }
+            for (const sub of r.submatches) {
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(r.path.text),
+                    new vscode.Position(r.line_number - 1, sub.start)
+                ));
             }
         }
         return locations;
@@ -186,65 +173,104 @@ export class JavaDefinitionProvider implements vscode.DefinitionProvider, vscode
 
     private async findBeanDefinition(beanName: string, originDocument: vscode.TextDocument): Promise<vscode.Location[]> {
         const derivedClassName = beanName.charAt(0).toUpperCase() + beanName.slice(1);
-        const files = await vscode.workspace.findFiles('**/*.java', EXCLUDE_PATTERN, 500);
         const locations: vscode.Location[] = [];
 
-        for (const file of files) {
-            if (file.fsPath === originDocument.uri.fsPath) { continue; }
-            const text = await this.getFileText(file);
-            if (!text) { continue; }
+        // 1. 类定义
+        const classPattern = `\\b(class|interface|enum|record)\\s+${this.escapeRegExp(derivedClassName)}\\b[\\s{]`;
+        const classResults = await this.rgSearch(classPattern, ['-g', '*.java']);
+        locations.push(...this.toLocations(classResults, originDocument));
 
-            const classRegex = new RegExp(`\\b(class|interface|enum|record)\\s+${this.escapeRegExp(derivedClassName)}\\b[\\s{]`, 'g');
-            let match;
-            while ((match = classRegex.exec(text)) !== null) {
-                const pos = this.offsetToPosition(text, match.index + match[0].indexOf(derivedClassName));
-                locations.push(new vscode.Location(file, pos));
+        // 2. Spring 注解类
+        const springPattern = `@(Service|Component|Repository|Controller|RestController)\\b[\\s\\S]{0,200}\\b(class|interface)\\s+${this.escapeRegExp(derivedClassName)}\\b[\\s{]`;
+        const springResults = await this.rgSearch(springPattern, ['-g', '*.java', '--multiline']);
+        locations.push(...this.toLocations(springResults, originDocument));
+
+        // 3. @Bean 方法
+        const beanPattern = `@Bean\\b[\\s\\S]{0,100}?\\s${this.escapeRegExp(beanName)}\\s*\\(`;
+        const beanResults = await this.rgSearch(beanPattern, ['-g', '*.java', '--multiline']);
+        for (const r of beanResults) {
+            if (r.path.text === originDocument.uri.fsPath) { continue; }
+            const lineText = r.lines.text;
+            const idx = lineText.indexOf(beanName);
+            if (idx >= 0) {
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(r.path.text),
+                    new vscode.Position(r.line_number - 1, idx)
+                ));
             }
+        }
 
-            const springAnnotationRegex = new RegExp(
-                `@(Service|Component|Repository|Controller|RestController)\\b[\\s\\S]{0,200}\\b(class|interface)\\s+${this.escapeRegExp(derivedClassName)}\\b[\\s{]`,
-                'g'
-            );
-            while ((match = springAnnotationRegex.exec(text)) !== null) {
-                const pos = this.offsetToPosition(text, match.index + match[0].indexOf(derivedClassName));
-                locations.push(new vscode.Location(file, pos));
-            }
+        return locations;
+    }
 
-            const beanMethodRegex = new RegExp(`@Bean\\b[\\s\\S]{0,100}?\\s${this.escapeRegExp(beanName)}\\s*\\(`, 'g');
-            while ((match = beanMethodRegex.exec(text)) !== null) {
-                const methodPos = match[0].lastIndexOf(beanName);
-                const pos = this.offsetToPosition(text, match.index + methodPos);
-                locations.push(new vscode.Location(file, pos));
+    private toLocations(results: RgMatch[], originDocument: vscode.TextDocument): vscode.Location[] {
+        const locations: vscode.Location[] = [];
+        for (const r of results) {
+            if (r.path.text === originDocument.uri.fsPath) { continue; }
+            for (const sub of r.submatches) {
+                const line = r.line_number - 1;
+                const char = sub.start;
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(r.path.text),
+                    new vscode.Position(line, char)
+                ));
             }
         }
         return locations;
     }
 
-    private async getFileText(uri: vscode.Uri): Promise<string | undefined> {
-        const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === uri.fsPath);
-        if (openDoc) {
-            return openDoc.getText();
-        }
-        try {
-            const stat = await vscode.workspace.fs.stat(uri);
-            const cached = this.fileCache.get(uri.fsPath);
-            if (cached && cached.mtime === stat.mtime) {
-                return cached.text;
+    private rgSearch(pattern: string, extraArgs: string[]): Promise<RgMatch[]> {
+        return new Promise((resolve, reject) => {
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                resolve([]);
+                return;
             }
-            const content = await vscode.workspace.fs.readFile(uri);
-            const text = Buffer.from(content).toString('utf-8');
-            this.fileCache.set(uri.fsPath, { text, mtime: stat.mtime });
-            return text;
-        } catch {
-            return undefined;
-        }
-    }
 
-    private offsetToPosition(text: string, offset: number): vscode.Position {
-        const lines = text.substring(0, offset).split(/\r?\n/);
-        const line = lines.length - 1;
-        const character = lines[lines.length - 1].length;
-        return new vscode.Position(line, character);
+            const args = [
+                '--json',
+                '--pcre2',
+                '-n', // line number
+                '-o', // only matching
+                ...EXCLUDE_DIRS.flatMap(d => ['-g', `!${d}`]),
+                ...extraArgs,
+                pattern,
+                workspaceFolders[0].uri.fsPath
+            ];
+
+            const proc = spawn(rgPath, args, { windowsHide: true });
+            const stdout: Buffer[] = [];
+            const stderr: Buffer[] = [];
+
+            proc.stdout.on('data', (data: Buffer) => stdout.push(data));
+            proc.stderr.on('data', (data: Buffer) => stderr.push(data));
+
+            proc.on('close', (code) => {
+                if (code !== 0 && code !== 1) {
+                    // code 1 means no matches, which is fine
+                    const err = Buffer.concat(stderr).toString('utf-8');
+                    reject(new Error(`ripgrep exited with ${code}: ${err}`));
+                    return;
+                }
+
+                const output = Buffer.concat(stdout).toString('utf-8');
+                const matches: RgMatch[] = [];
+                for (const line of output.split(/\r?\n/)) {
+                    if (!line.trim()) { continue; }
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.type === 'match') {
+                            matches.push(obj.data as RgMatch);
+                        }
+                    } catch {
+                        // ignore malformed json lines
+                    }
+                }
+                resolve(matches);
+            });
+
+            proc.on('error', (err) => reject(err));
+        });
     }
 
     private escapeRegExp(str: string): string {

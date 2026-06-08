@@ -7,3 +7,4 @@ scripts/**
 prompt.md
 tsconfig.json
 node_modules/**
+dist/**
