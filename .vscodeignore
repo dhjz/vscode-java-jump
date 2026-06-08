@@ -1,0 +1,9 @@
+.vscode/**
+.vscode-test/**
+src/**
+scripts/**
+.gitignore
+.vscodeignore
+prompt.md
+tsconfig.json
+node_modules/**
